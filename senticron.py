@@ -74,11 +74,19 @@ class PriorityQueueManager:
         
         self.running = False
         self.cpu_monitor = CPUMonitor(sample_interval=10.0)
+        self._pending_jobs: set = set()
         
     async def add_task(self, priority: int, command: str, timestamp: float, redirect_output: bool = False):
         """Add task to appropriate priority queue"""
         if priority not in self.priority_queues:
             priority = 1
+        
+        job_key = (command, timestamp)
+        if job_key in self._pending_jobs:
+            logger.debug(f"Job already pending, skipping: {command} (scheduled at {timestamp})")
+            return
+        
+        self._pending_jobs.add(job_key)
         await self.priority_queues[priority].put((timestamp, command, redirect_output))
         logger.info(f"Added task to priority {priority} queue: {command} ({self.priority_queues[priority].qsize()} tasks)")
         
@@ -159,13 +167,13 @@ class PriorityQueueManager:
 
     async def _consume_priority_queue(self, priority: int):
         """Consume tasks from a priority queue"""
-        print(f"Consumer {priority} started")  # Keep for initial confirmation
+        print(f"Consumer {priority} started")
         logger.info(f"Starting consumer for priority {priority} in _consume_priority_queue")
         queue = self.priority_queues[priority]
         
         while self.running:
             try:
-                await asyncio.sleep(0)  # Yield control
+                await asyncio.sleep(0)
                 timestamp, command, redirect_output = await asyncio.wait_for(queue.get(), timeout=5.0)
                 
                 logger.debug(f"Processing task from priority {priority} queue: {command}")
@@ -175,9 +183,13 @@ class PriorityQueueManager:
                 
                 if self.running:
                     await self._execute_command(command, priority, redirect_output)
-                    queue.task_done()
+                    self._pending_jobs.discard((command, timestamp))
                     logger.info(f"Completed task from priority {priority} queue: {command}")
-                    await asyncio.sleep(0.1)
+                else:
+                    self._pending_jobs.discard((command, timestamp))
+                
+                queue.task_done()
+                await asyncio.sleep(0.1)
             except asyncio.TimeoutError:
                 continue
             except Exception as e:
@@ -213,6 +225,11 @@ class PriorityQueueManager:
         for priority, queue in self.priority_queues.items():
             await queue.join()
             logger.info(f"Priority {priority} queue finished")
+        
+        pending_count = len(self._pending_jobs)
+        self._pending_jobs.clear()
+        if pending_count > 0:
+            logger.info(f"Cleared {pending_count} pending jobs")
 
 class AsyncCronScheduler:
     def __init__(self):

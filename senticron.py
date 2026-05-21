@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 class CronJob:
     def __init__(self, minute: str, hour: str, day: str, month: str, weekday: str, 
-                 command: str, priority: int, redirect_output: bool):
+                 command: str, priority: int, redirect_output: bool, onetime_id: str = None):
         self.minute = minute
         self.hour = hour
         self.day = day
@@ -25,10 +25,12 @@ class CronJob:
         self.command = command
         self.priority = priority
         self.redirect_output = redirect_output
+        self.onetime_id = onetime_id
         
     def __str__(self):
         redirect_str = " (redirect)" if self.redirect_output else ""
-        return f"CronJob('{self.minute} {self.hour} {self.day} {self.month} {self.weekday}' -> {self.command}, priority={self.priority}{redirect_str})"
+        onetime_str = f" (onetime: {self.onetime_id})" if self.onetime_id else ""
+        return f"CronJob('{self.minute} {self.hour} {self.day} {self.month} {self.weekday}' -> {self.command}, priority={self.priority}{redirect_str}{onetime_str})"
 
 class CPUMonitor:
     def __init__(self, sample_interval: float = 10.0):
@@ -67,7 +69,7 @@ class CPUMonitor:
         return self.cpu_usage < threshold
 
 class PriorityQueueManager:
-    def __init__(self):
+    def __init__(self, scheduler=None):
         self.priority_queues: Dict[int, asyncio.Queue] = {}
         for priority in range(1, 11):
             self.priority_queues[priority] = asyncio.Queue()
@@ -75,8 +77,9 @@ class PriorityQueueManager:
         self.running = False
         self.cpu_monitor = CPUMonitor(sample_interval=10.0)
         self._pending_jobs: set = set()
+        self.scheduler = scheduler
         
-    async def add_task(self, priority: int, command: str, timestamp: float, redirect_output: bool = False):
+    async def add_task(self, priority: int, command: str, timestamp: float, redirect_output: bool = False, onetime_id: str = None):
         """Add task to appropriate priority queue"""
         if priority not in self.priority_queues:
             priority = 1
@@ -87,7 +90,7 @@ class PriorityQueueManager:
             return
         
         self._pending_jobs.add(job_key)
-        await self.priority_queues[priority].put((timestamp, command, redirect_output))
+        await self.priority_queues[priority].put((timestamp, command, redirect_output, onetime_id))
         logger.info(f"Added task to priority {priority} queue: {command} ({self.priority_queues[priority].qsize()} tasks)")
         
     async def _execute_command(self, command: str, priority: int, redirect_output: bool = False) -> None:
@@ -174,7 +177,15 @@ class PriorityQueueManager:
         while self.running:
             try:
                 await asyncio.sleep(0)
-                timestamp, command, redirect_output = await asyncio.wait_for(queue.get(), timeout=5.0)
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=5.0)
+                    if len(item) == 4:
+                        timestamp, command, redirect_output, onetime_id = item
+                    else:
+                        timestamp, command, redirect_output = item
+                        onetime_id = None
+                except ValueError:
+                    continue
                 
                 logger.debug(f"Processing task from priority {priority} queue: {command}")
                 while self.running and not self.cpu_monitor.is_cpu_low(20.0):
@@ -185,6 +196,10 @@ class PriorityQueueManager:
                     await self._execute_command(command, priority, redirect_output)
                     self._pending_jobs.discard((command, timestamp))
                     logger.info(f"Completed task from priority {priority} queue: {command}")
+                    
+                    if onetime_id and self.scheduler:
+                        logger.info(f"Removing one-time job: {onetime_id}")
+                        self.scheduler.remove_onetime_job(onetime_id)
                 else:
                     self._pending_jobs.discard((command, timestamp))
                 
@@ -235,23 +250,60 @@ class AsyncCronScheduler:
     def __init__(self):
         self.jobs: List[CronJob] = []
         self.running = False
-        self.queue_manager = PriorityQueueManager()
+        self.queue_manager = PriorityQueueManager(scheduler=self)
         self.crontab_mtime = 0.0
         self.crontab_filename = None
+    
+    def remove_onetime_job(self, onetime_id: str) -> None:
+        """Remove a one-time job from crontab.txt by its ONETIME marker"""
+        if not self.crontab_filename or not os.path.exists(self.crontab_filename):
+            logger.warning(f"Crontab file not found for one-time job removal: {onetime_id}")
+            return
+        
+        try:
+            with open(self.crontab_filename, 'r') as f:
+                lines = f.readlines()
+            
+            new_lines = []
+            removed = False
+            skip_next = False
+            for line in lines:
+                if skip_next:
+                    skip_next = False
+                    removed = True
+                    logger.info(f"Removed job line following one-time marker: {onetime_id}")
+                    continue
+                if f"# ONETIME:{onetime_id}" in line:
+                    removed = True
+                    skip_next = True
+                    logger.info(f"Removed one-time marker: {onetime_id}")
+                    continue
+                new_lines.append(line)
+            
+            if removed:
+                with open(self.crontab_filename, 'w') as f:
+                    f.writelines(new_lines)
+                self.crontab_mtime = os.path.getmtime(self.crontab_filename)
+        except Exception as e:
+            logger.error(f"Error removing one-time job {onetime_id}: {e}")
 
     def parse_cron_file(self, filename: str) -> None:
         """Parse crontab file with mandatory priority and redirect parameters"""
         self.crontab_filename = filename
         self.crontab_mtime = os.path.getmtime(filename) if os.path.exists(filename) else 0.0
+        onetime_id = None
         try:
             with open(filename, 'r') as file:
                 for line_num, line in enumerate(file, 1):
-                    line = line.strip()
+                    line_stripped = line.strip()
                     
-                    if not line or line.startswith('#'):
+                    if not line_stripped or line_stripped.startswith('#'):
+                        match = re.search(r'# ONETIME:(\S+)', line_stripped)
+                        if match:
+                            onetime_id = match.group(1)
                         continue
                     
-                    logger.debug(f"Parsing line {line_num}: {line}")
+                    logger.debug(f"Parsing line {line_num}: {line_stripped}")
                     
                     try:
                         parts = shlex.split(line)
@@ -287,11 +339,12 @@ class AsyncCronScheduler:
                         logger.warning(f"Empty command on line {line_num}: {line}")
                         continue
                     
-                    logger.debug(f"Parsed: minute={minute}, hour={hour}, day={day}, month={month}, weekday={weekday}, command='{command}', priority={priority}, redirect={redirect_output}")
+                    logger.debug(f"Parsed: minute={minute}, hour={hour}, day={day}, month={month}, weekday={weekday}, command='{command}', priority={priority}, redirect={redirect_output}, onetime_id={onetime_id}")
                     
-                    job = CronJob(minute, hour, day, month, weekday, command, priority, redirect_output)
+                    job = CronJob(minute, hour, day, month, weekday, command, priority, redirect_output, onetime_id)
                     self.jobs.append(job)
                     logger.info(f"Loaded job: {job}")
+                    onetime_id = None
                 
         except FileNotFoundError:
             logger.error(f"Cron file {filename} not found")
@@ -310,6 +363,7 @@ class AsyncCronScheduler:
                     self.jobs.clear()
                     self.parse_cron_file(self.crontab_filename)
                     logger.info(f"Reloaded {self.crontab_filename}: {len(self.jobs)} jobs (previously {old_jobs})")
+                    await self._schedule_current_minute_jobs()
                     self.crontab_mtime = current_mtime
                 await asyncio.sleep(interval)
             except FileNotFoundError:
@@ -370,6 +424,26 @@ class AsyncCronScheduler:
         logger.info(f"Job {'should' if should_run else 'should not'} run: {job}")
         return should_run
 
+    async def _schedule_current_minute_jobs(self) -> int:
+        """Check all jobs against the current minute and enqueue matches"""
+        now = datetime.now().replace(second=0, microsecond=0)
+        logger.info(f"Checking jobs at {now}")
+        
+        jobs_scheduled = 0
+        for job in self.jobs:
+            if self._should_run_job(job, now):
+                await self.queue_manager.add_task(job.priority, job.command, now.timestamp(), job.redirect_output, job.onetime_id)
+                redirect_str = " (redirect)" if job.redirect_output else ""
+                onetime_str = f" (onetime: {job.onetime_id})" if job.onetime_id else ""
+                logger.info(f"Scheduled job: {job.command} (priority: {job.priority}){redirect_str}{onetime_str}")
+                jobs_scheduled += 1
+        
+        if jobs_scheduled > 0:
+            logger.info(f"Scheduled {jobs_scheduled} jobs at {now}")
+        else:
+            logger.info(f"No jobs to schedule at {now}")
+        return jobs_scheduled
+
     async def _scheduler_loop(self) -> None:
         """Main scheduler loop - producer"""
         logger.info("Scheduler loop started")
@@ -382,22 +456,9 @@ class AsyncCronScheduler:
                 now = datetime.now()
                 logger.debug(f"Scheduler tick at {now}")
                 
-                now = now.replace(second=0, microsecond=0)
-                logger.info(f"Checking jobs at {now}")
+                await self._schedule_current_minute_jobs()
                 
-                jobs_scheduled = 0
-                for job in self.jobs:
-                    if self._should_run_job(job, now):
-                        await self.queue_manager.add_task(job.priority, job.command, now.timestamp(), job.redirect_output)
-                        redirect_str = " (redirect)" if job.redirect_output else ""
-                        logger.info(f"Scheduled job: {job.command} (priority: {job.priority}){redirect_str}")
-                        jobs_scheduled += 1
-                
-                if jobs_scheduled > 0:
-                    logger.info(f"Scheduled {jobs_scheduled} jobs at {now}")
-                else:
-                    logger.info(f"No jobs to schedule at {now}")
-                
+                now = datetime.now().replace(second=0, microsecond=0)
                 next_minute = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
                 sleep_seconds = (next_minute - datetime.now()).total_seconds()
                 logger.debug(f"Sleeping for {sleep_seconds:.2f} seconds until {next_minute}")

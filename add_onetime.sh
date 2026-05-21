@@ -37,7 +37,7 @@ fi
 COMMAND="$1"
 TIME_ARG="${2:-}"
 PRIORITY="${3:-5}"
-REDIRECT="${4:-false}"
+REDIRECT="${4:-true}"
 
 if [ -z "$TIME_ARG" ]; then
     RUN_TIME=$(date -d "+10 seconds" "+%M %H %d %m *")
@@ -47,8 +47,15 @@ elif [[ "$TIME_ARG" =~ ^\+[0-9]+$ ]]; then
     RUN_TIME=$(date -d "+$SECONDS seconds" "+%M %H %d %m *")
     echo "Scheduling $SECONDS seconds from now..."
 elif [[ "$TIME_ARG" =~ ^[0-9]{2}:[0-9]{2}$ ]]; then
-    RUN_TIME=$(date -d "$TIME_ARG" "+%M %H %d %m *")
-    echo "Scheduling today at $TIME_ARG..."
+    TIME_EPOCH=$(date -d "$TIME_ARG" "+%s")
+    NOW_EPOCH=$(date "+%s")
+    if [ "$TIME_EPOCH" -le "$NOW_EPOCH" ]; then
+        RUN_TIME=$(date -d "$TIME_ARG +1 day" "+%M %H %d %m *")
+        echo "Scheduling tomorrow at $TIME_ARG (time already passed today)..."
+    else
+        RUN_TIME=$(date -d "$TIME_ARG" "+%M %H %d %m *")
+        echo "Scheduling today at $TIME_ARG..."
+    fi
 elif [[ "$TIME_ARG" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}$ ]]; then
     RUN_TIME=$(date -d "$TIME_ARG" "+%M %H %d %m %w")
     echo "Scheduling at $TIME_ARG..."
@@ -63,7 +70,7 @@ if ! [[ "$PRIORITY" =~ ^[1-9]$|^10$ ]]; then
 fi
 
 REDIRECT_LOWER=$(echo "$REDIRECT" | tr '[:upper:]' '[:lower:]')
-if [[ "$REDIRECT_LOWER" == "false" || "$REDIRECT_LOWER" == "0" ]]; then
+if [[ "$REDIRECT_LOWER" == "true" || "$REDIRECT_LOWER" == "1" ]]; then
     REDIRECT="true"
 else
     REDIRECT="false"
